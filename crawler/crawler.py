@@ -1,129 +1,106 @@
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from collections import deque
-import tldextract
+import json
 import os
-import threading
-import logging
-from concurrent.futures import ThreadPoolExecutor
+import tldextract
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 
-# Config
-USE_SELENIUM = False  # Set to True for JS rendering
-FILTER_EXTENSIONS = [".php", ".asp", ".aspx"]  # Leave empty to disable filtering
-MAX_DEPTH = 2
-MAX_THREADS = 10
+OUTPUT_DIR = "crawl_results"
 TARGETS_FILE = "targets.txt"
+MAX_PAGES = 10  # Number of pages to visit per domain
 
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
-lock = threading.Lock()
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def is_valid_url(url):
-    parsed = urlparse(url)
-    return parsed.scheme in ('http', 'https') and bool(parsed.netloc)
+def get_domain_root(url):
+    parts = tldextract.extract(url)
+    return f"{parts.domain}.{parts.suffix}"
 
-def get_domain(url):
-    extracted = tldextract.extract(url)
-    return f"{extracted.domain}.{extracted.suffix}"
+def get_browser():
+    caps = DesiredCapabilities.CHROME
+    caps["goog:loggingPrefs"] = {"performance": "ALL"}
 
-def get_html(url):
-    try:
-        if USE_SELENIUM:
-            chrome_options = Options()
-            chrome_options.add_argument("--headless")
-            driver = webdriver.Chrome(options=chrome_options)
-            driver.get(url)
-            html = driver.page_source
-            driver.quit()
-            return html
-        else:
-            response = requests.get(url, timeout=5)
-            if "text/html" in response.headers.get("Content-Type", ""):
-                return response.text
-    except Exception as e:
-        logging.debug(f"Error fetching {url}: {e}")
-    return ""
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--log-level=3")
 
-def crawl_url(base_url, current_url, domain, visited, queue, found_urls, depth):
-    if depth > MAX_DEPTH or current_url in visited:
-        return
-    html = get_html(current_url)
-    if not html:
-        return
+    return webdriver.Chrome(desired_capabilities=caps, options=chrome_options)
 
-    with lock:
-        visited.add(current_url)
-        found_urls.add(current_url)
+def extract_requests(driver):
+    logs = driver.get_log("performance")
+    urls = set()
 
-    soup = BeautifulSoup(html, 'html.parser')
-    tags = soup.find_all(['a', 'link', 'script', 'img'])
-
-    for tag in tags:
-        attr = 'href' if tag.name in ['a', 'link'] else 'src'
-        link = tag.get(attr)
-        if not link:
+    for entry in logs:
+        try:
+            message = json.loads(entry["message"])["message"]
+            if message["method"] == "Network.requestWillBeSent":
+                url = message["params"]["request"]["url"]
+                urls.add(url)
+        except Exception:
             continue
-        absolute_url = urljoin(current_url, link)
-        if not is_valid_url(absolute_url):
+    return urls
+
+def crawl_full_asset_map(start_url, max_pages=MAX_PAGES):
+    visited_urls = set()
+    all_assets = set()
+    queue = [start_url]
+    browser = get_browser()
+
+    while queue and len(visited_urls) < max_pages:
+        url = queue.pop(0)
+        if url in visited_urls:
             continue
-        if get_domain(absolute_url) != domain:
+        print(f"[+] Visiting: {url}")
+        try:
+            browser.get(url)
+            visited_urls.add(url)
+            assets = extract_requests(browser)
+            all_assets.update(assets)
+
+            # Add discovered links to queue (simple version)
+            new_links = [link for link in assets if link.startswith("http") and get_domain_root(link) == get_domain_root(start_url)]
+            queue.extend([l for l in new_links if l not in visited_urls])
+        except Exception as e:
+            print(f"[!] Failed: {url} ({e})")
             continue
-        if FILTER_EXTENSIONS and not any(absolute_url.lower().endswith(ext) for ext in FILTER_EXTENSIONS):
-            continue
 
-        with lock:
-            if absolute_url not in visited:
-                queue.append((absolute_url, depth + 1))
+    browser.quit()
+    return visited_urls, all_assets
 
-def crawl_domain(start_url):
-    domain = get_domain(start_url)
-    visited = set()
-    found_urls = set()
-    queue = deque([(start_url, 0)])
+def save_output(domain, visited, assets):
+    base = domain.replace('.', '_')
+    html_file = os.path.join(OUTPUT_DIR, f"{base}_sitemap.html")
+    json_file = os.path.join(OUTPUT_DIR, f"{base}_assets.json")
 
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        while queue:
-            tasks = []
-            for _ in range(min(len(queue), MAX_THREADS)):
-                url, depth = queue.popleft()
-                tasks.append(executor.submit(crawl_url, start_url, url, domain, visited, queue, found_urls, depth))
-            for task in tasks:
-                task.result()  # wait for completion
-
-    return sorted(found_urls)
-
-def save_to_html(domain, urls):
-    filename = f"{domain.replace('.', '_')}_sitemap.html"
-    with open(filename, 'w', encoding='utf-8') as f:
-        f.write("<html><body><h1>Sitemap for {}</h1><ul>\n".format(domain))
-        for url in urls:
+    with open(html_file, 'w', encoding='utf-8') as f:
+        f.write(f"<html><body><h1>Assets for {domain}</h1><ul>\n")
+        for url in sorted(assets):
             f.write(f"<li><a href='{url}'>{url}</a></li>\n")
         f.write("</ul></body></html>")
-    logging.info(f"[+] Saved {len(urls)} URLs to {filename}")
 
-def load_targets():
-    if os.path.exists(TARGETS_FILE):
-        with open(TARGETS_FILE, 'r') as f:
-            return [line.strip() for line in f if line.strip()]
-    return []
+    with open(json_file, 'w', encoding='utf-8') as f:
+        json.dump(sorted(assets), f, indent=2)
 
-def main():
-    print("[?] Enter a domain (or leave blank to use targets.txt):")
-    user_input = input("Domain: ").strip()
+    print(f"[✓] Saved {len(assets)} assets to {html_file} and {json_file}")
 
-    targets = [user_input] if user_input else load_targets()
+def run():
+    user_input = input("Enter a domain (or press Enter to use targets.txt): ").strip()
+    targets = [user_input] if user_input else []
+
     if not targets:
-        logging.error("No targets provided.")
-        return
+        if os.path.exists(TARGETS_FILE):
+            with open(TARGETS_FILE, 'r') as f:
+                targets = [line.strip() for line in f if line.strip()]
+        else:
+            print("No domain input or targets.txt found.")
+            return
 
     for target in targets:
         if not target.startswith("http"):
             target = "http://" + target
-        logging.info(f"[*] Crawling: {target}")
-        urls = crawl_domain(target)
-        save_to_html(get_domain(target), urls)
+        print(f"\n=== Crawling {target} ===")
+        visited, assets = crawl_full_asset_map(target)
+        save_output(get_domain_root(target), visited, assets)
 
 if __name__ == "__main__":
-    main()
+    run()
