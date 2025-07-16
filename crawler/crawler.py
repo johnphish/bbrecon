@@ -1,90 +1,111 @@
 import json
 import os
-import tldextract
+import time
+from urllib.parse import urljoin, urlparse
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
+from bs4 import BeautifulSoup
 
 OUTPUT_DIR = "crawl_results"
 TARGETS_FILE = "targets.txt"
-MAX_PAGES = 10  # Number of pages to visit per domain
+MAX_PAGES = 50  # Increase pages to crawl for better coverage
+WAIT_TIME = 2  # seconds to wait for page JS to load
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-def get_domain_root(url):
-    parts = tldextract.extract(url)
-    return f"{parts.domain}.{parts.suffix}"
 
 def get_browser():
     caps = DesiredCapabilities.CHROME
     caps["goog:loggingPrefs"] = {"performance": "ALL"}
 
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--log-level=3")
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--log-level=3")
+    driver = webdriver.Chrome(desired_capabilities=caps, options=options)
+    return driver
 
-    return webdriver.Chrome(desired_capabilities=caps, options=chrome_options)
-
-def extract_requests(driver):
+def extract_network_urls(driver):
     logs = driver.get_log("performance")
     urls = set()
-
     for entry in logs:
         try:
             message = json.loads(entry["message"])["message"]
             if message["method"] == "Network.requestWillBeSent":
                 url = message["params"]["request"]["url"]
                 urls.add(url)
-        except Exception:
+        except:
             continue
     return urls
 
-def crawl_full_asset_map(start_url, max_pages=MAX_PAGES):
-    visited_urls = set()
-    all_assets = set()
-    queue = [start_url]
-    browser = get_browser()
+def extract_dom_urls(html, base_url):
+    soup = BeautifulSoup(html, 'html.parser')
+    urls = set()
+    attrs = ['href', 'src', 'data-src']
+    tags = ['a', 'link', 'script', 'img', 'iframe', 'source']
 
-    while queue and len(visited_urls) < max_pages:
-        url = queue.pop(0)
-        if url in visited_urls:
+    for tag in soup.find_all(tags):
+        for attr in attrs:
+            url = tag.get(attr)
+            if url:
+                full_url = urljoin(base_url, url)
+                urls.add(full_url)
+    return urls
+
+def crawl(start_url):
+    visited = set()
+    assets_found = set()
+    to_visit = [start_url]
+
+    driver = get_browser()
+
+    while to_visit and len(visited) < MAX_PAGES:
+        url = to_visit.pop(0)
+        if url in visited:
             continue
-        print(f"[+] Visiting: {url}")
         try:
-            browser.get(url)
-            visited_urls.add(url)
-            assets = extract_requests(browser)
-            all_assets.update(assets)
+            print(f"[+] Visiting: {url}")
+            driver.get(url)
+            time.sleep(WAIT_TIME)  # Wait for JS/AJAX content to load
+            visited.add(url)
 
-            # Add discovered links to queue (simple version)
-            new_links = [link for link in assets if link.startswith("http") and get_domain_root(link) == get_domain_root(start_url)]
-            queue.extend([l for l in new_links if l not in visited_urls])
+            html = driver.page_source
+            dom_urls = extract_dom_urls(html, url)
+            net_urls = extract_network_urls(driver)
+
+            # Combine and add to asset list
+            all_urls = dom_urls.union(net_urls)
+            assets_found.update(all_urls)
+
+            # Add new URLs to visit queue if not visited
+            for link in all_urls:
+                if link not in visited and link not in to_visit:
+                    to_visit.append(link)
+
         except Exception as e:
-            print(f"[!] Failed: {url} ({e})")
-            continue
+            print(f"[!] Error visiting {url}: {e}")
 
-    browser.quit()
-    return visited_urls, all_assets
+    driver.quit()
+    return visited, assets_found
 
-def save_output(domain, visited, assets):
+def save_results(domain, visited, assets):
     base = domain.replace('.', '_')
     html_file = os.path.join(OUTPUT_DIR, f"{base}_sitemap.html")
     json_file = os.path.join(OUTPUT_DIR, f"{base}_assets.json")
 
     with open(html_file, 'w', encoding='utf-8') as f:
-        f.write(f"<html><body><h1>Assets for {domain}</h1><ul>\n")
-        for url in sorted(assets):
+        f.write(f"<html><body><h1>Assets & URLs for {domain}</h1><ul>\n")
+        for url in sorted(visited):
             f.write(f"<li><a href='{url}'>{url}</a></li>\n")
         f.write("</ul></body></html>")
 
     with open(json_file, 'w', encoding='utf-8') as f:
         json.dump(sorted(assets), f, indent=2)
 
-    print(f"[✓] Saved {len(assets)} assets to {html_file} and {json_file}")
+    print(f"[✓] Saved {len(visited)} visited pages and {len(assets)} assets.")
 
-def run():
-    user_input = input("Enter a domain (or press Enter to use targets.txt): ").strip()
+def main():
+    user_input = input("Enter a domain (or leave blank to use targets.txt): ").strip()
     targets = [user_input] if user_input else []
 
     if not targets:
@@ -98,9 +119,10 @@ def run():
     for target in targets:
         if not target.startswith("http"):
             target = "http://" + target
-        print(f"\n=== Crawling {target} ===")
-        visited, assets = crawl_full_asset_map(target)
-        save_output(get_domain_root(target), visited, assets)
+        print(f"\n=== Starting crawl for {target} ===")
+        visited, assets = crawl(target)
+        domain = urlparse(target).netloc
+        save_results(domain, visited, assets)
 
 if __name__ == "__main__":
-    run()
+    main()
