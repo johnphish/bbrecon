@@ -1,77 +1,76 @@
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, urljoin
-import json
+from urllib.parse import urljoin, urlparse
+from collections import deque
+import tldextract
 import os
 
-requests.packages.urllib3.disable_warnings()
+def is_valid_url(url):
+    parsed = urlparse(url)
+    return parsed.scheme in ('http', 'https') and bool(parsed.netloc)
 
-visited = set()
-sitemap = {}
+def get_domain(url):
+    extracted = tldextract.extract(url)
+    return f"{extracted.domain}.{extracted.suffix}"
 
-def normalize_url(base, link):
-    return urljoin(base, link.split('#')[0])
+def crawl_domain(start_url, max_depth=3):
+    visited = set()
+    queue = deque([(start_url, 0)])
+    domain = get_domain(start_url)
 
-def extract_links(html, base_url):
-    soup = BeautifulSoup(html, "html.parser")
-    links = set()
-    for tag in soup.find_all(["a", "link", "script", "img", "form"]):
-        for attr in ["href", "src", "action"]:
+    found_urls = []
+
+    while queue:
+        current_url, depth = queue.popleft()
+        if current_url in visited or depth > max_depth:
+            continue
+
+        try:
+            response = requests.get(current_url, timeout=5)
+            content_type = response.headers.get("Content-Type", "")
+            if "text/html" not in content_type:
+                continue
+        except Exception as e:
+            continue
+
+        visited.add(current_url)
+        found_urls.append(current_url)
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        for tag in soup.find_all(['a', 'link', 'script', 'img']):
+            attr = 'href' if tag.name == 'a' or tag.name == 'link' else 'src'
             link = tag.get(attr)
-            if link:
-                full_url = normalize_url(base_url, link)
-                if full_url.startswith("http"):
-                    links.add(full_url)
-    return links
+            if not link:
+                continue
 
-def add_to_sitemap(domain, path):
-    if domain not in sitemap:
-        sitemap[domain] = set()
-    sitemap[domain].add(path)
+            absolute_url = urljoin(current_url, link)
+            if is_valid_url(absolute_url) and get_domain(absolute_url) == domain:
+                queue.append((absolute_url, depth + 1))
 
-def crawl(url, depth=2):
-    if url in visited or depth <= 0:
-        return
-    visited.add(url)
+    return sorted(set(found_urls))
 
-    try:
-        resp = requests.get(url, timeout=5, verify=False)
-        parsed = urlparse(url)
-        if "text/html" in resp.headers.get("Content-Type", ""):
-            add_to_sitemap(parsed.netloc, parsed.path or "/")
-            links = extract_links(resp.text, url)
-            for link in links:
-                crawl(link, depth - 1)
-    except Exception:
-        pass
-
-def build_tree():
-    nodes = []
-    links = []
-    domain_nodes = {}
-
-    for domain, paths in sitemap.items():
-        domain_id = f"domain_{domain}"
-        nodes.append({"id": domain_id, "name": domain, "group": 1})
-        domain_nodes[domain] = domain_id
-        for path in paths:
-            path_id = f"{domain}_{path}"
-            nodes.append({"id": path_id, "name": path, "group": 2})
-            links.append({"source": domain_id, "target": path_id})
-    return {"nodes": nodes, "links": links}
+def save_to_html(domain, urls):
+    filename = f"{domain.replace('.', '_')}_sitemap.html"
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write("<html><body><h1>Sitemap for {}</h1><ul>\n".format(domain))
+        for url in urls:
+            f.write(f"<li><a href='{url}'>{url}</a></li>\n")
+        f.write("</ul></body></html>")
+    print(f"[+] Saved {len(urls)} URLs to {filename}")
 
 def main():
-    input_domains = input("Enter domains (comma-separated): ").split(",")
-    input_domains = [d.strip() for d in input_domains if d.strip()]
+    target_file = "targets.txt"
+    if not os.path.exists(target_file):
+        print(f"[!] Target list '{target_file}' not found.")
+        return
 
-    for domain in input_domains:
-        if not domain.startswith("http"):
-            domain = "https://" + domain
-        print(f"[+] Crawling: {domain}")
-        crawl(domain, depth=2)
+    with open(target_file, 'r') as f:
+        targets = [line.strip() for line in f if line.strip()]
 
-    tree_data = build_tree()
-    with open("site_structure.json", "w") as f:
-        json.dump(tree_data, f, indent=2)
+    for target in targets:
+        print(f"[*] Crawling {target}...")
+        urls = crawl_domain(target)
+        save_to_html(get_domain(target), urls)
 
-    print("[+] Site structure saved to site_structure.json")
+if __name__ == "__main__":
+    main()
