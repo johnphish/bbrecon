@@ -1,8 +1,13 @@
+from prompt_toolkit import prompt
+from prompt_toolkit.completion import PathCompleter
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import time
 import os
+import random
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # === ASCII Art ===
 ASCII_ART = r"""
@@ -82,14 +87,16 @@ USER_AGENTS = [
         "Mozilla/5.0 (Windows NT 6.2; WOW64) AppleWebKit/537.14 (KHTML, like Gecko) Chrome/24.0.1292.0 Safari/537.14",
         "Mozilla/5.0 (Windows NT 6.2; WOW64) AppleWebKit/537.13 (KHTML, like Gecko) Chrome/24.0.1290.1 Safari/537.13",
       "Mozilla/5.0 (Windows NT 6.2) AppleWebKit/537.13 (KHTML, like Gecko) Chrome/24.0.1290.1 Safari/537.13"
-    
-]
+    ]
+
 
 # Lock for thread-safe writes
 lock = threading.Lock()
 
 # Global results storage
 results = []
+
+
 
 # === Payload loaders (you implement payload files yourself) ===
 def load_payloads(payload_type):
@@ -123,7 +130,7 @@ def test_vulnerability(url, param, payload):
         else:
             target_url = f"{url}?{param}={payload}"
 
-        headers = {"User-Agent": USER_AGENTS[0]}  # Can randomize if desired
+        headers = {"User-Agent": random.choice(USER_AGENTS)} 
         resp = requests.get(target_url, headers=headers, timeout=TIMEOUT, verify=False)
 
         # Simple heuristic: check if payload is reflected or error codes, customize this
@@ -191,6 +198,7 @@ def load_targets():
         return []
 
     return targets
+  
 
 # === HTML report generation ===
 def generate_html_report(results, filename="scan_report.html"):
@@ -235,6 +243,41 @@ def main():
 
     print(f"[+] Scan finished. {len(results)} vulnerabilities found.")
     generate_html_report(results)
+      input_file = get_file_path_input("Enter path to the URL file: ")
+    while not os.path.isfile(input_file):
+        print(f"[!] File not found: {input_file}")
+        input_file = get_file_path_input("Try again: ")
+
+    with open(input_file, "r") as f:
+        urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+    live_urls = []
+    reflected = []
+
+    for url in tqdm(urls, desc="Checking URLs"):
+        live, body = is_live(url)
+        if not live:
+            continue
+
+        matched_params = extract_matching_params(url)
+        if matched_params:
+            live_urls.append(url)
+
+            # Check for reflection
+            for param, value in matched_params.items():
+                if param_reflected(param, value, body):
+                    reflected.append((url, param, value))
+
+    with open(OUTPUT_FILE, "w") as f:
+        for url in live_urls:
+            f.write(url + "\n")
+
+    with open(REFLECTED_FILE, "w") as f:
+        for url, param, value in reflected:
+            f.write(f"[!] {url} - Reflected param: {param}={value}\n")
+
+    print(f"\n[+] Live URLs with params saved to: {OUTPUT_FILE}")
+    print(f"[!] Reflected (possible vuln) URLs saved to: {REFLECTED_FILE}")
 
 if __name__ == "__main__":
     main()
